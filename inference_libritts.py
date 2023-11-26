@@ -122,67 +122,67 @@ def inference(text, ref_s, alpha=0.3, beta=0.7, diffusion_steps=5, embedding_sca
     ps = ' '.join(ps)
     tokens = textclenaer(ps)
     tokens.insert(0, 0)
-    tokens = torch.LongTensor(tokens).to(device).unsqueeze(0)
+    tokens = torch.LongTensor(tokens).to(device).unsqueeze(0)  # [1,14]
 
     with torch.no_grad():
-        input_lengths = torch.LongTensor([tokens.shape[-1]]).to(device)
-        text_mask = length_to_mask(input_lengths).to(device)
+        input_lengths = torch.LongTensor([tokens.shape[-1]]).to(device)  # s[1] 14
+        text_mask = length_to_mask(input_lengths).to(device)  # [1,14] False
 
-        t_en = model.text_encoder(tokens, input_lengths, text_mask)
-        bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())
-        d_en = model.bert_encoder(bert_dur).transpose(-1, -2)
+        t_en = model.text_encoder(tokens, input_lengths, text_mask)  # [1,512,14]
+        bert_dur = model.bert(tokens, attention_mask=(~text_mask).int())  # tokens [1,14]    attention_mask [1,14] all 1   bert_dur [1,14,768]
+        d_en = model.bert_encoder(bert_dur).transpose(-1, -2)  # [1,512,14]
 
-        s_pred = sampler(noise=torch.randn((1, 256)).unsqueeze(1).to(device),
-                         embedding=bert_dur,
-                         embedding_scale=embedding_scale,
-                         features=ref_s,  # reference from the same speaker as the embedding
-                         num_steps=diffusion_steps).squeeze(1)
+        s_pred = sampler(noise=torch.randn((1, 256)).unsqueeze(1).to(device),  # [1,1,256]
+                         embedding=bert_dur,  # [1,14,768]
+                         embedding_scale=embedding_scale,  # embedding_scale 1
+                         features=ref_s,  # [1,256]  # reference from the same speaker as the embedding
+                         num_steps=diffusion_steps).squeeze(1)  # diffusion_steps = 5  s_pred [1,256]
 
-        s = s_pred[:, 128:]
-        ref = s_pred[:, :128]
+        s = s_pred[:, 128:]  # s [1,128]
+        ref = s_pred[:, :128]  # ref [1,128]
 
-        ref = alpha * ref + (1 - alpha) * ref_s[:, :128]
-        s = beta * s + (1 - beta) * ref_s[:, 128:]
+        ref = alpha * ref + (1 - alpha) * ref_s[:, :128]  # alpha = 0.3  ref [1,128]
+        s = beta * s + (1 - beta) * ref_s[:, 128:]   # ref = 0.7  s [1, 128]
 
-        d = model.predictor.text_encoder(d_en,
-                                         s, input_lengths, text_mask)
+        d = model.predictor.text_encoder(d_en,  # [1,512,14]
+                                         s, input_lengths, text_mask)  # s [1,128] input_lengths=14  text_mask [1,14] all False  d [1,14,640]
 
-        x, _ = model.predictor.lstm(d)
-        duration = model.predictor.duration_proj(x)
+        x, _ = model.predictor.lstm(d)  # x [1,14,512]
+        duration = model.predictor.duration_proj(x)  # duration [1,14,50]
 
-        duration = torch.sigmoid(duration).sum(axis=-1)
-        pred_dur = torch.round(duration.squeeze()).clamp(min=1)
+        duration = torch.sigmoid(duration).sum(axis=-1)  # duration [1,14]
+        pred_dur = torch.round(duration.squeeze()).clamp(min=1)  # pred_dur [14]
 
-        pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))
+        pred_aln_trg = torch.zeros(input_lengths, int(pred_dur.sum().data))  # int(pred_dur.sum().data)=44  input_lengths = 14
         c_frame = 0
         for i in range(pred_aln_trg.size(0)):
             pred_aln_trg[i, c_frame:c_frame + int(pred_dur[i].data)] = 1
-            c_frame += int(pred_dur[i].data)
+            c_frame += int(pred_dur[i].data)  # construct mono align
 
         # encode prosody
-        en = (d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(device))
-        if model_params.decoder.type == "hifigan":
-            asr_new = torch.zeros_like(en)
-            asr_new[:, :, 0] = en[:, :, 0]
-            asr_new[:, :, 1:] = en[:, :, 0:-1]
+        en = (d.transpose(-1, -2) @ pred_aln_trg.unsqueeze(0).to(device))  # [1,14,640] > [1,640,14]  [1,14,44] > en: [1,640,44]
+        if model_params.decoder.type == "hifigan":  # yes
+            asr_new = torch.zeros_like(en)  # asr_new [1,640,44]
+            asr_new[:, :, 0] = en[:, :, 0]  # first frame initialize asr_new first frame
+            asr_new[:, :, 1:] = en[:, :, 0:-1]  # 0~-1 frame initialize asr_new 1: frame
             en = asr_new
 
-        F0_pred, N_pred = model.predictor.F0Ntrain(en, s)
+        F0_pred, N_pred = model.predictor.F0Ntrain(en, s)  # en=asr_new  s [1,128] -> F0_pred [1,88] N_pred [1,88]
 
-        asr = (t_en @ pred_aln_trg.unsqueeze(0).to(device))
+        asr = (t_en @ pred_aln_trg.unsqueeze(0).to(device))  # t_en [1,512,14] pred_aln_trg -> [1,14,44] -> [1,512,44]
         if model_params.decoder.type == "hifigan":
-            asr_new = torch.zeros_like(asr)
-            asr_new[:, :, 0] = asr[:, :, 0]
-            asr_new[:, :, 1:] = asr[:, :, 0:-1]
+            asr_new = torch.zeros_like(asr)  # asr_new [1,512,44]
+            asr_new[:, :, 0] = asr[:, :, 0]  # eg
+            asr_new[:, :, 1:] = asr[:, :, 0:-1]  # eg
             asr = asr_new
 
-        out = model.decoder(asr,
-                            F0_pred, N_pred, ref.squeeze().unsqueeze(0))
+        out = model.decoder(asr,  # asr [1,512,44]  F0_pred [1, 88]  N_pred [1,88]  ref [1,128]
+                            F0_pred, N_pred, ref.squeeze().unsqueeze(0))  # out [1,1,26400]
 
     return out.squeeze().cpu().numpy()[..., :-50]  # weird pulse at the end of the model, need to be fixed later
 reference_dicts = {}
 # format: (path, text)
-reference_dicts['1221-135767'] = ("Demo/reference_audio/1221-135767-0014.wav", "Yea, his honourable worship is within, but he hath a godly minister or two with him, and likewise a leech.")
+reference_dicts['1221-135767'] = ("Demo/reference_audio/1221-135767-0014.wav", "Hello world")
 reference_dicts['5639-40744'] = ("Demo/reference_audio/5639-40744-0020.wav", "Thus did this humane and right minded father comfort his unhappy daughter, and her mother embracing her again, did all she could to soothe her feelings.")
 reference_dicts['908-157963'] = ("Demo/reference_audio/908-157963-0027.wav", "And lay me down in my cold bed and leave my shining lot.")
 reference_dicts['4077-13754'] = ("Demo/reference_audio/4077-13754-0000.wav", "The army found the people in poverty and left them in comparative wealth.")
